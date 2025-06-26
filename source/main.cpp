@@ -2,17 +2,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
-#include <map>
-#include <iterator>
-#include <algorithm>
 #include <time.h>
 #include <sstream>
 
 // Include the main libnx system header, for Switch development
-#include <switch.h>
+// #include <switch.h>
 
 extern "C"
 {
+    #include "util.h"
     // Sysmodules should not use applet*.
     u32 __nx_applet_type = AppletType_None;
 
@@ -25,9 +23,15 @@ extern "C"
     void __libnx_initheap(void);
     void __appInit(void);
     void __appExit(void);
+
+    ViDisplay disp;
+    Event vsyncEvent;
 }
 
-Handle m_debugHandle;
+HidMouseState mouse_state;
+const u64 pause_toggle = HidMouseButton_Left;
+const u64 frame_advance_button = HidMouseButton_Right;
+u32 prev_mouse_buttons = 0;
 
 void __libnx_initheap(void)
 {
@@ -97,128 +101,115 @@ void __attribute__((weak)) __appExit(void)
     fsExit();
     timeExit();//Enable this if you want to use time.
     hidExit();// Enable this if you want to use HID.
+    
+    viCloseDisplay(&disp);
+    viExit();
     smExit();
 }
-
-std::map<int, std::string> translator
-{
-    {KEY_A, "KEY_A"},
-    {KEY_B, "KEY_B"},
-    {KEY_X, "KEY_X"},
-    {KEY_Y, "KEY_Y"},
-    {KEY_LSTICK, "KEY_LSTICK"},
-    {KEY_RSTICK, "KEY_RSTICK"},
-    {KEY_L, "KEY_L"},
-    {KEY_R, "KEY_R"},
-    {KEY_ZL, "KEY_ZL"},
-    {KEY_ZR, "KEY_ZR"},
-    {KEY_PLUS, "KEY_PLUS"},
-    {KEY_MINUS, "KEY_MINUS"},
-    {KEY_DLEFT, "KEY_DLEFT"},
-    {KEY_DUP, "KEY_DUP"},
-    {KEY_DRIGHT, "KEY_DRIGHT"},
-    {KEY_DDOWN, "KEY_DDOWN"},
-};
 
 std::string translateKeys(u64 keys)
 {
     std::string returnString;
-
-    for(std::pair<int, std::string> element : translator)
+    for (int i = 0; i < 16; ++i)
     {
-        if(element.first & keys)
+        if ((keys & (1 << i)))
         {
-            returnString.append(element.second);
-            returnString.push_back(';');
+            if (!returnString.empty()) returnString += ";";
+            returnString += "KEY_" + std::string(get_keys[i]);
         }
     }
+    return returnString.empty() ? "NONE" : returnString;
+}
 
-    if(!returnString.empty())
-    {
-        returnString.pop_back();
-        return returnString;
-    }
-
-    return "NONE";
+u32 getMouseDown()
+{
+    hidGetMouseStates(&mouse_state, 1);
+    u32 cur_mouse_buttons = mouse_state.buttons;
+    u32 ret = (~prev_mouse_buttons) & cur_mouse_buttons;
+    prev_mouse_buttons = cur_mouse_buttons;
+    return ret;
 }
 
 // Main program entrypoint
 int main(int argc, char* argv[])
 {
-    ViDisplay disp;
+    // init
     Result rc = viOpenDefaultDisplay(&disp);
     if(R_FAILED(rc))
         fatalThrow(rc);
-    Event vsync_event;
-    rc = viGetDisplayVsyncEvent(&disp, &vsync_event);
+    rc = viGetDisplayVsyncEvent(&disp, &vsyncEvent);
     if(R_FAILED(rc))
         fatalThrow(rc);
 
     // Initialization code can go here.
-    bool isPaused = false;
     int frameCount = 0;
-    FILE* f;
+    FILE* f = NULL;
+
+    // Configure our supported input layout: a single player with standard controller styles
+    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+
+
+    // Initialize the default gamepad (which reads handheld mode inputs as well as the first connected controller)
+    PadState pad;
+    padInitializeDefault(&pad);
+
+    // Initialize the mouse
+    hidInitializeMouse();
 
     // Your code / main loop goes here.
     // If you need threads, you can use threadCreate etc.
     while(true)
     {
-        // Scan all the inputs. This should be done once for each frame
-        hidScanInput();
-
-        // hidKeysDown returns information about which buttons have been
-        // just pressed in this frame compared to the previous one
-        if (hidKeyboardDown(KBD_DOWN) && !isPaused)
+        // Scan the gamepad. This should be done once for each frame
+        padUpdate(&pad);
+        u32 mouseDown = getMouseDown();
+        if (mouseDown & pause_toggle)
         {
-            u64 pid = 0;
-            pmdmntGetApplicationProcessId(&pid);
-            svcDebugActiveProcess(&m_debugHandle, pid);
+            if (getIsPaused())
+            {
+                detach();
+                if (f != NULL)
+                {
+                    fclose(f);
+                    f = NULL;
+                }
+            }
+            else
+            {
+                attach();
+                frameCount = 0;
 
-            isPaused = true;
-            frameCount = 0;
-
-            time_t unixTime = time(NULL);
-            struct tm* timeStruct = localtime((const time_t *)&unixTime);
-            std::stringstream ss;
-            std::string filename;
-            ss << "/pausenx/recording-" << timeStruct->tm_mon + 1 << "_" << timeStruct->tm_mday << "_" << timeStruct->tm_year + 1900 << "-" << timeStruct->tm_hour << "_" << timeStruct->tm_min << "_" << timeStruct->tm_sec << ".txt";
-            ss >> filename;
-            f = fopen(filename.c_str(), "w");
+                time_t unixTime = time(NULL);
+                struct tm* timeStruct = localtime((const time_t *)&unixTime);
+                std::stringstream ss;
+                std::string filename;
+                ss << "/scripts/pausenx/recording-" << timeStruct->tm_mon + 1 << "_" << timeStruct->tm_mday << "_" << timeStruct->tm_year + 1900 << "-" << timeStruct->tm_hour << "_" << timeStruct->tm_min << "_" << timeStruct->tm_sec << ".txt";
+                ss >> filename;
+                f = fopen(filename.c_str(), "w");
+            }
         }
-        else if(hidKeyboardDown(KBD_DOWN) && isPaused)
-        {   
-            svcCloseHandle(m_debugHandle);
-            isPaused = false;
-            fclose(f);
-        }
-
-        if(hidKeyboardDown(KBD_RIGHT) && isPaused)
+        else if((mouseDown & frame_advance_button) && getIsPaused())
         {
-            svcCloseHandle(m_debugHandle);
-
-            //Gather button and stick data
-            u64 kHeld = hidKeysHeld(CONTROLLER_P1_AUTO);
+            // log controller state
+            u64 kHeld = padGetButtons(&pad);
             std::string keyString = translateKeys(kHeld);
 
-            JoystickPosition posLeft, posRight;
-            hidJoystickRead(&posLeft, CONTROLLER_P1_AUTO, JOYSTICK_LEFT);
-            hidJoystickRead(&posRight, CONTROLLER_P1_AUTO, JOYSTICK_RIGHT);
+            HidAnalogStickState posLeft = padGetStickPos(&pad, 0);
+            HidAnalogStickState posRight = padGetStickPos(&pad, 1);
 
-            if(!(keyString == "NONE" && posLeft.dx == 0 && posLeft.dy == 0 && posRight.dy == 0 && posRight.dy == 0))
-                fprintf(f, "%i %s %d;%d %d;%d\n", frameCount, keyString.c_str(), posLeft.dx, posLeft.dy, posRight.dx, posRight.dy);
+            if(!(keyString == "NONE" && posLeft.x == 0 && posLeft.y == 0 && posRight.x == 0 && posRight.y == 0))
+            {
+                if (f != NULL)
+                {
+                    fprintf(f, "%i %s %d;%d %d;%d\n", frameCount, keyString.c_str(), posLeft.x, posLeft.y, posRight.x, posRight.y);
+                }
+            }
 
-            rc = eventWait(&vsync_event, 0xFFFFFFFFFFF);
-            if(R_FAILED(rc))
-                fatalThrow(rc);
-
-            u64 pid = 0;
-            pmdmntGetApplicationProcessId(&pid);
-            svcDebugActiveProcess(&m_debugHandle, pid);
-
+            advanceOneFrame();
             frameCount++;
         }
         
-        rc = eventWait(&vsync_event, 0xFFFFFFFFFFF);
+        rc = eventWait(&vsyncEvent, 0xFFFFFFFFFFF);
         if(R_FAILED(rc))
             fatalThrow(rc);
     }
